@@ -116,6 +116,7 @@ def get_default_audio_backend() -> "AudioBackend":
         # so we add this as an option to support them.
         backends.append(FfmpegSubprocessOpusBackend())
     backends += [
+        FfmpegSubprocessM4aBackend(),
         # Use sph2pipe for .sph and shorten encoded audio
         Sph2pipeSubprocessBackend(),
         # Libsndfile seems to be the most stable backend in terms of covered formats and performance.
@@ -272,6 +273,40 @@ class FfmpegSubprocessOpusBackend(AudioBackend):
         force_opus_sampling_rate: Optional[int] = None,
     ):
         return opus_info(path_or_fd, force_opus_sampling_rate)
+
+class FfmpegSubprocessM4aBackend(AudioBackend):
+    def read_audio(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        force_opus_sampling_rate: Optional[int] = None,
+    ):
+        assert isinstance(
+            path_or_fd, (str, Path)
+        ), f"Cannot use an ffmpeg subprocess to read from path of type: '{type(path_or_fd)}'"
+        return read_m4a_ffmpeg(
+            path=path_or_fd,
+            offset=offset,
+            duration=duration,
+        )
+
+    def handles_special_case(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        return isinstance(path_or_fd, (str, Path)) and str(path_or_fd).lower().endswith(
+            ".m4a"
+        )
+
+    def is_applicable(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        return self.handles_special_case(path_or_fd)
+
+    def supports_info(self) -> bool:
+        return True
+
+    def info(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+    ):
+        return torchaudio_ffmpeg_streamer_info(path_or_fd)
 
 
 class Sph2pipeSubprocessBackend(AudioBackend):
@@ -1312,6 +1347,29 @@ def read_opus_torchaudio(
     resampled_audio = resampler(audio)
     return resampled_audio, force_opus_sampling_rate
 
+def read_m4a_ffmpeg(
+    path: Pathlike,
+    offset: Seconds = 0.0,
+    duration: Optional[Seconds] = None,
+) -> Tuple[np.ndarray, int]:
+    # Construct the ffmpeg command depending on the arguments passed.
+    cmd = "ffmpeg -threads 1"
+    if offset > 0:
+        cmd += f" -ss {offset}"
+    if duration is not None:
+        cmd += f" -t {duration}"
+    # Add the input specifier after offset and duration.
+    cmd += f" -i '{path}'"
+
+    # Read audio samples directly as float32.
+    cmd += " -ac 1 -f f32le -threads 1 pipe:1"
+
+    # Actual audio reading.
+    proc = run(cmd, shell=True, stdout=PIPE, stderr=PIPE)
+    raw_audio = proc.stdout
+    audio = np.frombuffer(raw_audio, dtype=np.float32)
+    sample_rate = parse_sample_rate_from_ffmpeg_output(proc.stderr)
+    return audio, sample_rate
 
 def read_opus_ffmpeg(
     path: Pathlike,
@@ -1388,6 +1446,29 @@ def parse_channel_from_ffmpeg_output(ffmpeg_stderr: bytes) -> str:
             return match.group(1)
     raise ValueError(
         f"Could not determine the number of channels for OPUS file from the following ffmpeg output "
+        f"(shown as bytestring due to avoid possible encoding issues):\n{str(ffmpeg_stderr)}"
+    )
+
+def parse_sample_rate_from_ffmpeg_output(ffmpeg_stderr: bytes) -> str:
+    # ffmpeg will output line such as the following, amongst others:
+    # "Stream #0:0: Audio: pcm_f32le, 16000 Hz, mono, flt, 512 kb/s"
+    # but sometimes it can be "Stream #0:0(eng):", which we handle with regexp
+    pattern = re.compile(r"^\s*Stream #0:0.*: Audio: pcm_f32le,.* (\d+) Hz.+\s*$")
+    for line in ffmpeg_stderr.splitlines():
+        try:
+            line = line.decode()
+        except UnicodeDecodeError:
+            # Why can we get UnicodeDecoderError from ffmpeg output?
+            # Because some files may contain the metadata, including a short description of the recording,
+            # which may be encoded in arbitrarily encoding different than ASCII/UTF-8, such as latin-1,
+            # and Python will not automatically recognize that.
+            # We simply ignore these lines as they won't have any relevant information for us.
+            continue
+        match = pattern.match(line)
+        if match is not None:
+            return int(match.group(1))
+    raise ValueError(
+        f"Could not determine the sample rate of the m4a file from the following ffmpeg output "
         f"(shown as bytestring due to avoid possible encoding issues):\n{str(ffmpeg_stderr)}"
     )
 
